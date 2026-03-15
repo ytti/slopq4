@@ -1,0 +1,3 @@
+[workspace]
+members = ["slopq4", "slopq4-cli"]
+resolver = "2"
