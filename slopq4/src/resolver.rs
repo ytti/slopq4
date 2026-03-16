@@ -86,6 +86,37 @@ impl Resolver {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Afi, AnnotatedRoute, RouteObject, RpkiStatus, WorkKey};
+    use crate::rpki::RpkiDb;
+
+    #[test]
+    fn two_asns_same_prefix_both_unknown() {
+        let prefix: ipnet::IpNet = "203.0.113.0/24".parse().unwrap();
+        let asn1: Asn = 65001;
+        let asn2: Asn = 65002;
+
+        let make_result = |asn: Asn| {
+            let key = WorkKey { afi: Afi::V4, asn };
+            let route = AnnotatedRoute {
+                route: RouteObject { prefix, origin: asn },
+                rpki: RpkiStatus::Unknown,
+            };
+            Ok::<_, tokio::task::JoinError>((key, Ok::<_, IrrError>(vec![route])))
+        };
+
+        let task_results = vec![make_result(asn1), make_result(asn2)];
+        let rpki = RpkiDb::build(vec![]);
+        let report = aggregate("AS-TEST", &[asn1, asn2], task_results, &rpki);
+
+        assert_eq!(report.prefix.unknown.len(), 2);
+        assert!(report.prefix.unknown.contains(&("203.0.113.0/24".into(), asn1)));
+        assert!(report.prefix.unknown.contains(&("203.0.113.0/24".into(), asn2)));
+    }
+}
+
 /// Fetch all route objects for one (AFI, ASN) and annotate with RPKI status.
 async fn fetch_and_annotate(
     key: WorkKey,
