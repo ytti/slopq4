@@ -30,6 +30,7 @@ mod tests {
             as_set: "AS-TEST".into(),
             asns: AsnReport { valid: vec![42, 500], invalid: vec![] },
             prefix: PrefixReport {
+                valid: vec![],
                 unknown: vec![("1.2.3.0/24".into(), 42)],
                 invalid: vec![],
             },
@@ -46,7 +47,7 @@ mod tests {
         let report = Report {
             as_set: "AS-TEST".into(),
             asns: AsnReport { valid: vec![1], invalid: vec![2] },
-            prefix: PrefixReport { unknown: vec![], invalid: vec![("10.0.0.0/8".into(), 1)] },
+            prefix: PrefixReport { valid: vec![], unknown: vec![], invalid: vec![("10.0.0.0/8".into(), 1)] },
         };
         let json = JsonFormatter.format(&report).unwrap();
         let back: Report = serde_json::from_str(&json).unwrap();

@@ -67,6 +67,7 @@ pub struct AsnReport {
 /// Prefix entries serialise as `[prefix_string, origin_asn]` JSON arrays.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrefixReport {
+    pub valid: Vec<(String, Asn)>,
     pub unknown: Vec<(String, Asn)>,
     pub invalid: Vec<(String, Asn)>,
 }
@@ -76,7 +77,7 @@ impl Report {
         Self {
             as_set: String::new(),
             asns: AsnReport { valid: vec![], invalid: vec![] },
-            prefix: PrefixReport { unknown: vec![], invalid: vec![] },
+            prefix: PrefixReport { valid: vec![], unknown: vec![], invalid: vec![] },
         }
     }
 }

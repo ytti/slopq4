@@ -116,6 +116,7 @@ fn aggregate(
     rpki: &RpkiDb,
 ) -> Report {
     let mut asn_has_routes: HashSet<Asn> = HashSet::new();
+    let mut prefix_valid: Vec<(String, Asn)> = vec![];
     let mut prefix_unknown: Vec<(String, Asn)> = vec![];
     let mut prefix_invalid: Vec<(String, Asn)> = vec![];
 
@@ -132,7 +133,9 @@ fn aggregate(
         for ar in routes {
             asn_has_routes.insert(key.asn);
             match ar.rpki {
-                RpkiStatus::Valid => {} // valid prefixes are not reported
+                RpkiStatus::Valid => {
+                    prefix_valid.push((ar.route.prefix.to_string(), ar.route.origin));
+                }
                 RpkiStatus::Unknown => {
                     prefix_unknown.push((ar.route.prefix.to_string(), ar.route.origin));
                 }
@@ -156,12 +159,17 @@ fn aggregate(
 
     valid_asns.sort_unstable();
     invalid_asns.sort_unstable();
+    prefix_valid.sort_unstable_by_key(|(p, a)| (p.clone(), *a));
     prefix_unknown.sort_unstable_by_key(|(p, a)| (p.clone(), *a));
     prefix_invalid.sort_unstable_by_key(|(p, a)| (p.clone(), *a));
 
     Report {
         as_set: as_set.to_owned(),
         asns: crate::model::AsnReport { valid: valid_asns, invalid: invalid_asns },
-        prefix: crate::model::PrefixReport { unknown: prefix_unknown, invalid: prefix_invalid },
+        prefix: crate::model::PrefixReport {
+            valid: prefix_valid,
+            unknown: prefix_unknown,
+            invalid: prefix_invalid,
+        },
     }
 }

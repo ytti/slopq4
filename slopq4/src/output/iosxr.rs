@@ -40,7 +40,7 @@ mod tests {
         Report {
             as_set: "AS-TEST".into(),
             asns: AsnReport { valid, invalid: vec![] },
-            prefix: PrefixReport { unknown: vec![], invalid: vec![] },
+            prefix: PrefixReport { valid: vec![], unknown: vec![], invalid: vec![] },
         }
     }
 

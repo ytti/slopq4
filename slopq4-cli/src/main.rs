@@ -41,6 +41,10 @@ struct Cli {
     #[arg(long, default_value_t = 100)]
     workers: usize,
 
+    /// Include RPKI-valid prefixes in JSON output
+    #[arg(long)]
+    valid_prefixes: bool,
+
     /// NOS-specific output formats written to {AS-SET}.{ext} files (comma-separated: junos,iosxr)
     #[arg(long, value_delimiter = ',')]
     nos: Vec<String>,
@@ -72,7 +76,7 @@ async fn main() {
     let irr_cfg = IrrConfig { host: cli.irr_host, port: cli.irr_port };
     let resolver = Resolver::new(irr_cfg, rpki_db, cli.workers);
 
-    let report = resolver.resolve(&cli.as_set).await.unwrap_or_else(|e| {
+    let mut report = resolver.resolve(&cli.as_set).await.unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(1)
     });
@@ -82,6 +86,11 @@ async fn main() {
         Format::Json => "json",
     })
     .unwrap();
+
+    // Strip valid prefixes unless explicitly requested
+    if !cli.valid_prefixes {
+        report.prefix.valid.clear();
+    }
 
     let has_file_output = !cli.nos.is_empty() || cli.slurm || cli.audit;
 
