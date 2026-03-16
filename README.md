@@ -8,10 +8,8 @@ Unknown route-objects are synthesized via SLURM as RPKI valid.
 RPKI valid which do not appear in AS-SET (e.g. AS-YTTI cannot advertise RPKI
 valid Google) are dropped by verifying that origin in AS_PATH matches IRR data
 
-RPKI validation is done against rpki.json produced by rpki-client, this is
-redundant against irrd4, as it already rejects invalids and returns validation
-status on the route objects. If it is always redundant, it can be optimised
-away.
+RPKI validation from IRRd is trusted, unless optional --rpki-json is provided
+which should contain rpki-client produced rpki.json.
 
 WARNING: entirely LLM slopped POC 
 

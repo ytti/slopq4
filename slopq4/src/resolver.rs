@@ -4,7 +4,7 @@ use std::sync::Arc;
 use futures::future::join_all;
 use tokio::sync::{mpsc, Semaphore};
 
-use crate::irr::{IrrClient, IrrConfig, IrrError};
+use crate::irr::{fetch_routes_with_rpki, IrrClient, IrrConfig, IrrError};
 use crate::model::{Afi, AnnotatedRoute, Asn, Report, RouteObject, RpkiStatus, WorkKey};
 use crate::rpki::RpkiDb;
 
@@ -16,15 +16,16 @@ pub enum ResolveError {
 
 pub struct Resolver {
     pub irr_cfg: Arc<IrrConfig>,
-    pub rpki: Arc<RpkiDb>,
+    /// `None` = use IRRd4 inline `rpki-ov-state`; `Some` = local RPKI validation.
+    pub rpki: Option<Arc<RpkiDb>>,
     pub workers: usize,
 }
 
 impl Resolver {
-    pub fn new(irr_cfg: IrrConfig, rpki: RpkiDb, workers: usize) -> Self {
+    pub fn new(irr_cfg: IrrConfig, rpki: Option<RpkiDb>, workers: usize) -> Self {
         Self {
             irr_cfg: Arc::new(irr_cfg),
-            rpki: Arc::new(rpki),
+            rpki: rpki.map(Arc::new),
             workers,
         }
     }
@@ -58,11 +59,11 @@ impl Resolver {
             .map(|key| {
                 let sem = Arc::clone(&sem);
                 let irr_cfg = Arc::clone(&self.irr_cfg);
-                let rpki = Arc::clone(&self.rpki);
+                let rpki = self.rpki.as_ref().map(Arc::clone);
                 let tx = tx.clone();
                 tokio::spawn(async move {
                     let _permit = sem.acquire().await.expect("semaphore closed");
-                    let result = fetch_and_annotate(key, &irr_cfg, &rpki).await;
+                    let result = fetch_and_annotate(key, &irr_cfg, rpki.as_deref()).await;
                     let _ = tx.send(());
                     (key, result)
                 })
@@ -81,31 +82,67 @@ impl Resolver {
         let task_results = join_all(handles).await;
         progress_task.await.ok();
 
+        // Surface MissingRpkiState immediately rather than silently treating it as no routes.
+        for result in &task_results {
+            if let Ok((_, Err(IrrError::MissingRpkiState))) = result {
+                return Err(ResolveError::Irr(IrrError::MissingRpkiState));
+            }
+        }
+
         // --- Step 4: aggregate into Report ---
-        Ok(aggregate(as_set, &asns, task_results, &self.rpki))
+        Ok(aggregate(as_set, &asns, task_results, self.rpki.as_deref()))
     }
 }
 
 /// Fetch all route objects for one (AFI, ASN) and annotate with RPKI status.
+///
+/// - `rpki = Some(db)`: use `!g`/`!6` prefix queries + local `RpkiDb` validation.
+/// - `rpki = None`: use RPSL object query, map `rpki-ov-state` to `RpkiStatus`.
 async fn fetch_and_annotate(
     key: WorkKey,
     irr_cfg: &IrrConfig,
-    rpki: &RpkiDb,
+    rpki: Option<&RpkiDb>,
 ) -> Result<Vec<AnnotatedRoute>, IrrError> {
-    let mut client = IrrClient::connect(irr_cfg).await?;
-    let prefixes = match key.afi {
-        Afi::V4 => client.routes_v4(key.asn).await?,
-        Afi::V6 => client.routes_v6(key.asn).await?,
-    };
-    let routes = prefixes
-        .into_iter()
-        .map(|prefix| {
-            let route = RouteObject { prefix, origin: key.asn };
-            let rpki_status = rpki.validate(route.prefix, route.origin);
-            AnnotatedRoute { route, rpki: rpki_status }
-        })
-        .collect();
-    Ok(routes)
+    if let Some(db) = rpki {
+        let mut client = IrrClient::connect(irr_cfg).await?;
+        // Local RPKI path: fast prefix-list query + local validation.
+        let prefixes = match key.afi {
+            Afi::V4 => client.routes_v4(key.asn).await?,
+            Afi::V6 => client.routes_v6(key.asn).await?,
+        };
+        Ok(prefixes
+            .into_iter()
+            .map(|prefix| {
+                let route = RouteObject { prefix, origin: key.asn };
+                let rpki_status = db.validate(route.prefix, route.origin);
+                AnnotatedRoute { route, rpki: rpki_status }
+            })
+            .collect())
+    } else {
+        // IRRd4 inline RPKI path: non-persistent RPSL text query with rpki-ov-state.
+        let irr_routes = fetch_routes_with_rpki(irr_cfg, key.asn, key.afi).await?;
+        Ok(irr_routes
+            .into_iter()
+            .map(|r| {
+                let rpki_status = match r.rpki_ov_state.as_deref() {
+                    Some("valid")     => RpkiStatus::Valid,
+                    Some("not_found") => RpkiStatus::Unknown,
+                    None => {
+                        tracing::warn!(prefix = %r.prefix, asn = key.asn, "no rpki-ov-state");
+                        RpkiStatus::Unknown
+                    }
+                    Some(other) => {
+                        tracing::warn!(prefix = %r.prefix, asn = key.asn, state = other, "unexpected rpki-ov-state");
+                        RpkiStatus::Invalid
+                    }
+                };
+                AnnotatedRoute {
+                    route: RouteObject { prefix: r.prefix, origin: key.asn },
+                    rpki: rpki_status,
+                }
+            })
+            .collect())
+    }
 }
 
 /// Aggregate task results into the final Report.
@@ -113,7 +150,7 @@ fn aggregate(
     as_set: &str,
     all_asns: &[Asn],
     task_results: Vec<Result<(WorkKey, Result<Vec<AnnotatedRoute>, IrrError>), tokio::task::JoinError>>,
-    rpki: &RpkiDb,
+    rpki: Option<&RpkiDb>,
 ) -> Report {
     let mut asn_has_routes: HashSet<Asn> = HashSet::new();
     let mut prefix_valid: Vec<(String, Asn)> = vec![];
@@ -150,7 +187,9 @@ fn aggregate(
     let mut invalid_asns: Vec<Asn> = vec![];
 
     for &asn in all_asns {
-        if asn_has_routes.contains(&asn) || rpki.asn_has_roa(asn) {
+        let is_valid = asn_has_routes.contains(&asn)
+            || rpki.map_or(false, |db| db.asn_has_roa(asn));
+        if is_valid {
             valid_asns.push(asn);
         } else {
             invalid_asns.push(asn);

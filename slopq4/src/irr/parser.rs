@@ -57,6 +57,71 @@ pub fn parse_asn_list(data: &str) -> Vec<Asn> {
         .collect()
 }
 
+/// A route object returned by IRRd4, with optional inline RPKI validation state.
+#[derive(Debug, PartialEq, Eq)]
+pub struct IrrRoute {
+    pub prefix: IpNet,
+    /// Value of the `rpki-ov-state:` attribute, or `None` if absent.
+    pub rpki_ov_state: Option<String>,
+}
+
+/// Parse a Found frame payload containing RPSL route objects into `IrrRoute` entries.
+///
+/// Objects are separated by blank lines. Each object must have a `route:` or
+/// `route6:` attribute; objects without a parseable prefix are silently skipped.
+///
+/// Handles CRLF line endings and strips inline RPSL comments (`# ...`).
+pub fn parse_route_objects(data: &str) -> Vec<IrrRoute> {
+    // Normalise CRLF → LF so blank-line splitting works regardless of server line endings.
+    let normalised;
+    let data = if data.contains('\r') {
+        normalised = data.replace("\r\n", "\n").replace('\r', "\n");
+        &*normalised
+    } else {
+        data
+    };
+
+    data.split("\n\n")
+        .filter(|block| !block.trim().is_empty())
+        .filter_map(|block| {
+            let mut prefix: Option<IpNet> = None;
+            let mut rpki_ov_state: Option<String> = None;
+            let mut source: Option<String> = None;
+
+            for line in block.lines() {
+                // Helper: strip inline comment and surrounding whitespace.
+                let value_of = |rest: &str| -> String {
+                    rest.trim().split('#').next().unwrap_or("").trim().to_owned()
+                };
+
+                if let Some(rest) = line.strip_prefix("route6:").or_else(|| line.strip_prefix("route:")) {
+                    if prefix.is_none() {
+                        let v = value_of(rest);
+                        prefix = v.parse::<IpNet>().ok();
+                    }
+                } else if let Some(rest) = line.strip_prefix("rpki-ov-state:") {
+                    let v = value_of(rest);
+                    if !v.is_empty() {
+                        rpki_ov_state = Some(v);
+                    }
+                } else if let Some(rest) = line.strip_prefix("source:") {
+                    let v = value_of(rest);
+                    if !v.is_empty() {
+                        source = Some(v);
+                    }
+                }
+            }
+
+            // Objects with `source: RPKI` are auto-generated from ROA data — implicitly valid.
+            if source.as_deref().map(|s| s.eq_ignore_ascii_case("RPKI")).unwrap_or(false) {
+                rpki_ov_state = Some("valid".to_owned());
+            }
+
+            prefix.map(|p| IrrRoute { prefix: p, rpki_ov_state })
+        })
+        .collect()
+}
+
 /// Parse a Found frame payload into a list of IP prefixes.
 pub fn parse_prefix_list(data: &str) -> Result<Vec<IpNet>, IrrError> {
     data.split_whitespace()
@@ -136,5 +201,112 @@ mod tests {
     #[test]
     fn parse_frame_unknown() {
         assert!(parse_frame("X something\n").is_err());
+    }
+
+    // --- parse_route_objects ---
+
+    const RPSL_V4: &str = "\
+route:          192.0.2.0/24\n\
+descr:          Test\n\
+origin:         AS64496\n\
+rpki-ov-state:  valid\n";
+
+    const RPSL_V6: &str = "\
+route6:         2001:db8::/32\n\
+origin:         AS64496\n\
+rpki-ov-state:  not_found\n";
+
+    #[test]
+    fn route_objects_single_v4_valid() {
+        let routes = parse_route_objects(RPSL_V4);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].prefix.to_string(), "192.0.2.0/24");
+        assert_eq!(routes[0].rpki_ov_state, Some("valid".into()));
+    }
+
+    #[test]
+    fn route_objects_single_v6_not_found() {
+        let routes = parse_route_objects(RPSL_V6);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].prefix.to_string(), "2001:db8::/32");
+        assert_eq!(routes[0].rpki_ov_state, Some("not_found".into()));
+    }
+
+    #[test]
+    fn route_objects_no_rpki_state() {
+        let data = "route:          10.0.0.0/8\norigin:         AS64496\n";
+        let routes = parse_route_objects(data);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].rpki_ov_state, None);
+    }
+
+    #[test]
+    fn route_objects_multiple() {
+        let data = format!("{}\n{}", RPSL_V4, RPSL_V6);
+        let routes = parse_route_objects(&data);
+        assert_eq!(routes.len(), 2);
+    }
+
+    #[test]
+    fn route_objects_trailing_blank_line() {
+        let data = format!("{}\n\n", RPSL_V4);
+        let routes = parse_route_objects(&data);
+        assert_eq!(routes.len(), 1);
+    }
+
+    #[test]
+    fn route_objects_empty_input() {
+        assert_eq!(parse_route_objects(""), vec![]);
+    }
+
+    #[test]
+    fn route_objects_crlf_line_endings() {
+        let data = "route:          192.0.2.0/24\r\norigin:         AS64496\r\nrpki-ov-state:  valid\r\n\r\nroute:          198.51.100.0/24\r\norigin:         AS64496\r\nrpki-ov-state:  not_found\r\n";
+        let routes = parse_route_objects(data);
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].rpki_ov_state.as_deref(), Some("valid"));
+        assert_eq!(routes[1].rpki_ov_state.as_deref(), Some("not_found"));
+    }
+
+    #[test]
+    fn route_objects_inline_comment_stripped() {
+        let data = "route:          192.0.2.0/24\norigin:         AS64496\nrpki-ov-state:  not_found # No ROAs found, or RPKI validation not enabled for source\n";
+        let routes = parse_route_objects(data);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].rpki_ov_state.as_deref(), Some("not_found"));
+    }
+
+    #[test]
+    fn route_objects_rpki_source_is_valid() {
+        let data = "\
+route:          192.0.2.0/24\n\
+origin:         AS64496\n\
+source:         RPKI\n";
+        let routes = parse_route_objects(data);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].rpki_ov_state.as_deref(), Some("valid"));
+    }
+
+    #[test]
+    fn route_objects_rpki_source_with_comment() {
+        let data = "\
+route:          192.0.2.0/24\n\
+origin:         AS64496\n\
+source:         RPKI  # Trust Anchor: apnic\n";
+        let routes = parse_route_objects(data);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].rpki_ov_state.as_deref(), Some("valid"));
+    }
+
+    #[test]
+    fn route_objects_irr_source_unaffected() {
+        let data = "\
+route:          192.0.2.0/24\n\
+origin:         AS64496\n\
+source:         APNIC\n\
+rpki-ov-state:  not_found\n";
+        let routes = parse_route_objects(data);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].rpki_ov_state.as_deref(), Some("not_found"));
     }
 }

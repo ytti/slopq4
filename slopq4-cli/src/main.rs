@@ -25,7 +25,7 @@ struct Cli {
     #[arg(long, default_value_t = 43)]
     irr_port: u16,
 
-    /// Path to rpki.json or rpki.json.gz (fetched from internet if omitted)
+    /// Path to rpki.json or rpki.json.gz for local RPKI validation (overrides IRRd4 rpki-ov-state)
     #[arg(long)]
     rpki_json: Option<PathBuf>,
 
@@ -62,15 +62,19 @@ struct Cli {
 async fn main() {
     let cli = Cli::parse();
 
-    // Load and index RPKI data
-    let rpki_bytes = load_rpki_json(cli.rpki_json.as_deref())
-        .await
-        .unwrap_or_else(|e| { eprintln!("error: failed to load rpki.json: {e}"); std::process::exit(1) });
-
-    let roas = parse_rpki_json(&rpki_bytes)
-        .unwrap_or_else(|e| { eprintln!("error: failed to parse rpki.json: {e}"); std::process::exit(1) });
-
-    let rpki_db = RpkiDb::build(roas);
+    // Load local RPKI database only when --rpki-json is explicitly given.
+    // Without it, IRRd4's inline rpki-ov-state is used instead.
+    let rpki_db: Option<RpkiDb> = match cli.rpki_json.as_deref() {
+        Some(path) => {
+            let bytes = load_rpki_json(Some(path))
+                .await
+                .unwrap_or_else(|e| { eprintln!("error: failed to load rpki.json: {e}"); std::process::exit(1) });
+            let roas = parse_rpki_json(&bytes)
+                .unwrap_or_else(|e| { eprintln!("error: failed to parse rpki.json: {e}"); std::process::exit(1) });
+            Some(RpkiDb::build(roas))
+        }
+        None => None,
+    };
 
     // Resolve AS-SET
     let irr_cfg = IrrConfig { host: cli.irr_host, port: cli.irr_port };
